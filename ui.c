@@ -11,16 +11,19 @@ const char MoneyMul[4] = {
 };
 
 void draw_player_scene(Canvas *const canvas, const GameState *game_state) {
-    int max_card = game_state->player_card_count;
-
-    if (max_card > 0)
-        draw_deck((game_state->player_cards), max_card, canvas);
+    // During split, show whichever hand is currently being played
+    if (game_state->split && game_state->playing_split) {
+        if (game_state->split_card_count > 0)
+            draw_deck(game_state->split_cards, game_state->split_card_count, canvas);
+    } else {
+        if (game_state->player_card_count > 0)
+            draw_deck(game_state->player_cards, game_state->player_card_count, canvas);
+    }
 
     if (game_state->dealer_card_count > 0)
         draw_card_back_at(13, 5, canvas);
 
-    max_card = game_state->dealer_card_count;
-    if (max_card > 1) {
+    if (game_state->dealer_card_count > 1) {
         draw_card_at(2, 2, game_state->dealer_cards[1].pip, game_state->dealer_cards[1].character,
                    canvas);
     }

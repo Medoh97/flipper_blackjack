@@ -68,6 +68,13 @@ typedef struct {
     bool doubled;
     bool started;
     bool processing;
+
+    bool split;
+    bool playing_split;
+    bool first_hand_busted;
+    Card split_cards[21];
+    uint8_t split_card_count;
+    uint32_t split_bet;
     Deck deck;
     PlayState state;
     QueueState queue_state;

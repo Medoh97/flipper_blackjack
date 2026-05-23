@@ -18,18 +18,37 @@
 
 #define DEALER_MAX 17
 
+// Menu item indices
+#define MENU_DOUBLE 0
+#define MENU_SPLIT  1
+#define MENU_HIT    2
+#define MENU_STAY   3
+
 void start_round(GameState *game_state);
 
 void init(GameState *game_state);
 
 static void draw_ui(Canvas *const canvas, const GameState *game_state) {
-
     draw_money(canvas, game_state->player_score);
 
-    draw_score(canvas, true, hand_count(game_state->player_cards, game_state->player_card_count));
+    if (game_state->split) {
+        canvas_set_font(canvas, FontSecondary);
+        char drawChar[20];
+        uint8_t score;
+        if (game_state->playing_split) {
+            score = hand_count(game_state->split_cards, game_state->split_card_count);
+            snprintf(drawChar, sizeof(drawChar), "Hand 2: %i", score);
+        } else {
+            score = hand_count(game_state->player_cards, game_state->player_card_count);
+            snprintf(drawChar, sizeof(drawChar), "Hand 1: %i", score);
+        }
+        canvas_draw_str_aligned(canvas, 64, 2, AlignCenter, AlignTop, drawChar);
+    } else {
+        draw_score(canvas, true, hand_count(game_state->player_cards, game_state->player_card_count));
+    }
 
     if (!game_state->queue_state.running && game_state->state == GameStatePlay) {
-        render_menu(game_state->menu,canvas, 2, 47);
+        render_menu(game_state->menu, canvas, 2, 47);
     }
 }
 
@@ -72,15 +91,30 @@ Card draw_card(GameState *game_state) {
     return c;
 }
 
-
 void drawPlayerCard(void *ctx) {
     GameState *game_state = ctx;
     Card c = draw_card(game_state);
     game_state->player_cards[game_state->player_card_count] = c;
     game_state->player_card_count++;
-    if(game_state->player_score < game_state->settings.round_price || game_state->doubled){
-        set_menu_state(game_state->menu, 0, false);
+
+    if (game_state->player_score < game_state->settings.round_price || game_state->doubled) {
+        set_menu_state(game_state->menu, MENU_DOUBLE, false);
     }
+
+    // Split is only available on the initial 2-card deal with matching ranks
+    if (!game_state->split) {
+        bool can_split = (game_state->player_card_count == 2) &&
+                         (game_state->player_cards[0].character == game_state->player_cards[1].character) &&
+                         (game_state->player_score >= game_state->settings.round_price);
+        set_menu_state(game_state->menu, MENU_SPLIT, can_split);
+    }
+}
+
+void drawSplitCard(void *ctx) {
+    GameState *game_state = ctx;
+    Card c = draw_card(game_state);
+    game_state->split_cards[game_state->split_card_count] = c;
+    game_state->split_card_count++;
 }
 
 void drawDealerCard(void *ctx) {
@@ -140,12 +174,19 @@ void to_start(const void *ctx, Canvas *const canvas) {
     elements_multiline_text_aligned(canvas, 64, 22, AlignCenter, AlignCenter, "Round started");
 }
 
+void to_hand2_state(const void *ctx, Canvas *const canvas) {
+    const GameState *game_state = ctx;
+    if (game_state->settings.message_duration == 0)
+        return;
+    popup_frame(canvas);
+    elements_multiline_text_aligned(canvas, 64, 22, AlignCenter, AlignCenter, "Hand 2");
+}
+
 void before_start(void *ctx) {
     GameState *game_state = ctx;
     game_state->dealer_card_count = 0;
     game_state->player_card_count = 0;
 }
-
 
 void start(void *ctx) {
     GameState *game_state = ctx;
@@ -173,8 +214,7 @@ void lose(void *ctx) {
         enqueue(&(game_state->queue_state), game_state, start, before_start, to_start,
                 game_state->settings.message_duration);
     } else {
-        enqueue(&(game_state->queue_state), game_state, game_over, NULL, NULL,
-                0);
+        enqueue(&(game_state->queue_state), game_state, game_over, NULL, NULL, 0);
     }
 }
 
@@ -188,15 +228,67 @@ void win(void *ctx) {
             game_state->settings.message_duration);
 }
 
+// Payout for a split round — evaluates both hands against the dealer independently.
+void splitPayout(void *ctx) {
+    GameState *game_state = ctx;
+    game_state->state = GameStatePlay;
+
+    uint8_t dealer_score = hand_count(game_state->dealer_cards, game_state->dealer_card_count);
+    bool any_win = false;
+
+    if (!game_state->first_hand_busted) {
+        uint8_t first_score = hand_count(game_state->player_cards, game_state->player_card_count);
+        if (dealer_score > 21 || first_score > dealer_score) {
+            game_state->player_score += game_state->bet * 2;
+            any_win = true;
+        } else if (first_score == dealer_score) {
+            game_state->player_score += game_state->bet; // push
+        }
+    }
+
+    uint8_t split_score = hand_count(game_state->split_cards, game_state->split_card_count);
+    bool split_busted = (split_score > 21);
+    if (!split_busted) {
+        if (dealer_score > 21 || split_score > dealer_score) {
+            game_state->player_score += game_state->split_bet * 2;
+            any_win = true;
+        } else if (split_score == dealer_score) {
+            game_state->player_score += game_state->split_bet; // push
+        }
+    }
+
+    if (any_win)
+        dolphin_deed(DolphinDeedPluginGameWin);
+
+    game_state->bet = 0;
+    game_state->split_bet = 0;
+
+    if (game_state->player_score >= game_state->settings.round_price) {
+        enqueue(&(game_state->queue_state), game_state, start, before_start, to_start,
+                game_state->settings.message_duration);
+    } else {
+        enqueue(&(game_state->queue_state), game_state, game_over, NULL, NULL, 0);
+    }
+}
 
 void dealerTurn(void *ctx) {
     GameState *game_state = ctx;
     game_state->state = GameStateDealer;
 }
 
-float animationTime(const GameState *game_state){
-    return (float) (furi_get_tick() - game_state->queue_state.start) /
-           (float) (game_state->settings.animation_duration);
+// Switches play to the second (split) hand.
+void firstHandDone(void *ctx) {
+    GameState *game_state = ctx;
+    game_state->playing_split = true;
+    set_menu_state(game_state->menu, MENU_HIT, true);
+    set_menu_state(game_state->menu, MENU_STAY, true);
+    game_state->menu->enabled = true;
+    game_state->menu->current_menu = MENU_HIT;
+}
+
+float animationTime(const GameState *game_state) {
+    return (float)(furi_get_tick() - game_state->queue_state.start) /
+           (float)(game_state->settings.animation_duration);
 }
 
 void dealer_card_animation(const void *ctx, Canvas *const canvas) {
@@ -206,65 +298,74 @@ void dealer_card_animation(const void *ctx, Canvas *const canvas) {
     Card animatingCard = game_state->deck.cards[game_state->deck.index];
     if (game_state->dealer_card_count > 1) {
         Vector end = card_pos_at_index(game_state->dealer_card_count);
-        draw_card_animation(animatingCard,
-                            (Vector) {0, 64},
-                            (Vector) {0, 32},
-                            end,
-                            t,
-                            true,
-                            canvas);
+        draw_card_animation(animatingCard, (Vector){0, 64}, (Vector){0, 32}, end, t, true, canvas);
     } else {
-        draw_card_animation(animatingCard,
-                            (Vector) {32, -CARD_HEIGHT},
-                            (Vector) {64, 32},
-                            (Vector) {2, 2},
-                            t,
-                            false,
-                            canvas);
+        draw_card_animation(animatingCard, (Vector){32, -CARD_HEIGHT}, (Vector){64, 32},
+                            (Vector){2, 2}, t, false, canvas);
     }
 }
 
 void dealer_back_card_animation(const void *ctx, Canvas *const canvas) {
     const GameState *game_state = ctx;
     float t = animationTime(game_state);
-
-    Vector currentPos = quadratic_2d((Vector) {32, -CARD_HEIGHT}, (Vector) {64, 32}, (Vector) {13, 5}, t);
+    Vector currentPos = quadratic_2d((Vector){32, -CARD_HEIGHT}, (Vector){64, 32}, (Vector){13, 5}, t);
     draw_card_back_at(currentPos.x, currentPos.y, canvas);
 }
 
 void player_card_animation(const void *ctx, Canvas *const canvas) {
     const GameState *game_state = ctx;
     float t = animationTime(game_state);
-
     Card animatingCard = game_state->deck.cards[game_state->deck.index];
     Vector end = card_pos_at_index(game_state->player_card_count);
+    draw_card_animation(animatingCard, (Vector){32, -CARD_HEIGHT}, (Vector){0, 32}, end, t, true, canvas);
+}
 
-    draw_card_animation(animatingCard,
-                        (Vector) {32, -CARD_HEIGHT},
-                        (Vector) {0, 32},
-                        end,
-                        t,
-                        true,
-                        canvas);
+void split_card_animation(const void *ctx, Canvas *const canvas) {
+    const GameState *game_state = ctx;
+    float t = animationTime(game_state);
+    Card animatingCard = game_state->deck.cards[game_state->deck.index];
+    Vector end = card_pos_at_index(game_state->split_card_count);
+    draw_card_animation(animatingCard, (Vector){32, -CARD_HEIGHT}, (Vector){0, 32}, end, t, true, canvas);
 }
 //endregion
 
 void player_tick(GameState *game_state) {
-    uint8_t score = hand_count(game_state->player_cards, game_state->player_card_count);
-    if ((game_state->doubled && score <= 21) || score == 21) {
-        enqueue(&(game_state->queue_state), game_state, dealerTurn, NULL, to_dealer_turn,
-                game_state->settings.message_duration);
-    } else if (score > 21) {
-        enqueue(&(game_state->queue_state), game_state, lose, NULL, to_bust_state,
-                game_state->settings.message_duration);
+    uint8_t score;
+    if (game_state->split && game_state->playing_split) {
+        score = hand_count(game_state->split_cards, game_state->split_card_count);
     } else {
-        if(game_state->selectDirection == DirectionUp || game_state->selectDirection == DirectionDown){
+        score = hand_count(game_state->player_cards, game_state->player_card_count);
+    }
+
+    if ((game_state->doubled && score <= 21) || score == 21) {
+        if (game_state->split && !game_state->playing_split) {
+            // First hand is done (21 or doubled), switch to split hand
+            enqueue(&(game_state->queue_state), game_state, firstHandDone, NULL, to_hand2_state,
+                    game_state->settings.message_duration);
+        } else {
+            enqueue(&(game_state->queue_state), game_state, dealerTurn, NULL, to_dealer_turn,
+                    game_state->settings.message_duration);
+        }
+    } else if (score > 21) {
+        if (game_state->split && !game_state->playing_split) {
+            // First hand busted, record it and switch to split hand
+            game_state->first_hand_busted = true;
+            enqueue(&(game_state->queue_state), game_state, firstHandDone, NULL, to_bust_state,
+                    game_state->settings.message_duration);
+        } else if (game_state->split && game_state->playing_split) {
+            // Split hand busted — go to dealer (splitPayout will handle both hands)
+            enqueue(&(game_state->queue_state), game_state, dealerTurn, NULL, to_bust_state,
+                    game_state->settings.message_duration);
+        } else {
+            enqueue(&(game_state->queue_state), game_state, lose, NULL, to_bust_state,
+                    game_state->settings.message_duration);
+        }
+    } else {
+        if (game_state->selectDirection == DirectionUp || game_state->selectDirection == DirectionDown) {
             move_menu(game_state->menu, game_state->selectDirection == DirectionUp ? -1 : 1);
         }
-
-        if (game_state->selectDirection == Select){
+        if (game_state->selectDirection == Select) {
             activate_menu(game_state->menu, game_state);
-
         }
     }
 }
@@ -274,7 +375,9 @@ void dealer_tick(GameState *game_state) {
     uint8_t player_score = hand_count(game_state->player_cards, game_state->player_card_count);
 
     if (dealer_score >= DEALER_MAX) {
-        if (dealer_score > 21 || dealer_score < player_score) {
+        if (game_state->split) {
+            enqueue(&(game_state->queue_state), game_state, splitPayout, NULL, NULL, 0);
+        } else if (dealer_score > 21 || dealer_score < player_score) {
             enqueue(&(game_state->queue_state), game_state, win, NULL, to_win_state,
                     game_state->settings.message_duration);
         } else if (dealer_score > player_score) {
@@ -307,7 +410,7 @@ void settings_tick(GameState *game_state) {
                     nextScore -= 10;
                 else
                     nextScore += 10;
-                if (nextScore >= (int) game_state->settings.round_price && nextScore < 400)
+                if (nextScore >= (int)game_state->settings.round_price && nextScore < 400)
                     game_state->settings.starting_money = nextScore;
                 break;
             case 1:
@@ -316,7 +419,7 @@ void settings_tick(GameState *game_state) {
                     nextScore -= 10;
                 else
                     nextScore += 10;
-                if (nextScore >= 5 && nextScore <= (int) game_state->settings.starting_money)
+                if (nextScore >= 5 && nextScore <= (int)game_state->settings.starting_money)
                     game_state->settings.round_price = nextScore;
                 break;
             case 2:
@@ -343,7 +446,6 @@ void settings_tick(GameState *game_state) {
                 break;
         }
     }
-
 }
 
 void tick(GameState *game_state) {
@@ -388,20 +490,24 @@ void tick(GameState *game_state) {
     }
 
     game_state->selectDirection = None;
-
 }
 
 void start_round(GameState *game_state) {
-    game_state->menu->current_menu=1;
+    game_state->menu->current_menu = MENU_HIT;
     game_state->player_card_count = 0;
     game_state->dealer_card_count = 0;
-    set_menu_state(game_state->menu, 0, true);
-    game_state->menu->enabled=true;
+    set_menu_state(game_state->menu, MENU_DOUBLE, true);
+    set_menu_state(game_state->menu, MENU_SPLIT, false); // disabled until deal
+    game_state->menu->enabled = true;
     game_state->started = false;
     game_state->doubled = false;
+    game_state->split = false;
+    game_state->playing_split = false;
+    game_state->split_card_count = 0;
+    game_state->split_bet = 0;
+    game_state->first_hand_busted = false;
     game_state->queue_state.running = true;
     shuffle_deck(&(game_state->deck));
-    game_state->doubled = false;
     game_state->bet = game_state->settings.round_price;
     if (game_state->player_score < game_state->settings.round_price) {
         game_state->state = GameStateGameOver;
@@ -412,9 +518,9 @@ void start_round(GameState *game_state) {
 }
 
 void init(GameState *game_state) {
-    set_menu_state(game_state->menu, 0, true);
-    game_state->menu->enabled=true;
-    game_state->menu->current_menu=1;
+    set_menu_state(game_state->menu, MENU_DOUBLE, true);
+    game_state->menu->enabled = true;
+    game_state->menu->current_menu = MENU_HIT;
     game_state->settings = load_settings();
     game_state->last_tick = 0;
     game_state->processing = true;
@@ -436,9 +542,9 @@ static void update_timer_callback(FuriMessageQueue *event_queue) {
     furi_message_queue_put(event_queue, &event, 0);
 }
 
-void doubleAction(void *state){
+void doubleAction(void *state) {
     GameState *game_state = state;
-    if (!game_state->doubled &&  game_state->player_score >= game_state->settings.round_price) {
+    if (!game_state->doubled && game_state->player_score >= game_state->settings.round_price) {
         game_state->player_score -= game_state->settings.round_price;
         game_state->bet += game_state->settings.round_price;
         game_state->doubled = true;
@@ -453,19 +559,66 @@ void doubleAction(void *state){
             enqueue(&(game_state->queue_state), game_state, dealerTurn, NULL, to_dealer_turn,
                     game_state->settings.message_duration);
         }
-        set_menu_state(game_state->menu, 0, false);
+        set_menu_state(game_state->menu, MENU_DOUBLE, false);
     }
 }
 
-void hitAction(void *state){
+// Split the current two-card hand into two independent hands.
+void splitAction(void *state) {
     GameState *game_state = state;
+
+    // Guard: must have exactly 2 matching cards, not already split, and afford the extra bet
+    if (game_state->split ||
+        game_state->player_card_count != 2 ||
+        game_state->player_cards[0].character != game_state->player_cards[1].character ||
+        game_state->player_score < game_state->settings.round_price) {
+        return;
+    }
+
+    // Pay for the second hand
+    game_state->player_score -= game_state->settings.round_price;
+    game_state->split_bet = game_state->settings.round_price;
+
+    // Move the second card to the split hand
+    game_state->split_cards[0] = game_state->player_cards[1];
+    game_state->split_card_count = 1;
+    game_state->player_card_count = 1;
+
+    game_state->split = true;
+    game_state->playing_split = false;
+    game_state->first_hand_busted = false;
+
+    // Disable Double and Split for the remainder of the round
+    set_menu_state(game_state->menu, MENU_DOUBLE, false);
+    set_menu_state(game_state->menu, MENU_SPLIT, false);
+
+    // Deal one new card to each hand (split hand card is instant, no animation)
     enqueue(&(game_state->queue_state), game_state, drawPlayerCard, NULL, player_card_animation,
             game_state->settings.animation_duration);
+    enqueue(&(game_state->queue_state), game_state, drawSplitCard, NULL, NULL, 0);
 }
-void stayAction(void *state){
+
+void hitAction(void *state) {
     GameState *game_state = state;
-    enqueue(&(game_state->queue_state), game_state, dealerTurn, NULL, to_dealer_turn,
-            game_state->settings.message_duration);
+    if (game_state->split && game_state->playing_split) {
+        enqueue(&(game_state->queue_state), game_state, drawSplitCard, NULL, split_card_animation,
+                game_state->settings.animation_duration);
+    } else {
+        enqueue(&(game_state->queue_state), game_state, drawPlayerCard, NULL, player_card_animation,
+                game_state->settings.animation_duration);
+    }
+}
+
+void stayAction(void *state) {
+    GameState *game_state = state;
+    if (game_state->split && !game_state->playing_split) {
+        // Done with first hand — switch to split hand with no popup delay
+        enqueue(&(game_state->queue_state), game_state, firstHandDone, NULL, to_hand2_state,
+                game_state->settings.message_duration);
+    } else {
+        enqueue(&(game_state->queue_state), game_state, dealerTurn, NULL, to_dealer_turn,
+                game_state->settings.message_duration);
+    }
 }
 
 int32_t blackjack_app(void *p) {
@@ -476,12 +629,14 @@ int32_t blackjack_app(void *p) {
     FuriMessageQueue *event_queue = furi_message_queue_alloc(8, sizeof(AppEvent));
     dolphin_deed(DolphinDeedPluginGameStart);
     GameState *game_state = malloc(sizeof(GameState));
-    game_state->menu= malloc(sizeof(Menu));
-    game_state->menu->menu_width=40;
+    game_state->menu = malloc(sizeof(Menu));
+    game_state->menu->menu_width = 40;
     init(game_state);
-    add_menu(game_state->menu, "Double", doubleAction);
-    add_menu(game_state->menu, "Hit", hitAction);
-    add_menu(game_state->menu, "Stay", stayAction);
+    add_menu(game_state->menu, "Double", doubleAction); // MENU_DOUBLE = 0
+    add_menu(game_state->menu, "Split", splitAction);   // MENU_SPLIT  = 1
+    add_menu(game_state->menu, "Hit", hitAction);       // MENU_HIT    = 2
+    add_menu(game_state->menu, "Stay", stayAction);     // MENU_STAY   = 3
+    set_menu_state(game_state->menu, MENU_SPLIT, false); // Split disabled until valid deal
     set_card_graphics(&I_card_graphics);
 
     game_state->state = GameStateStart;
@@ -498,7 +653,7 @@ int32_t blackjack_app(void *p) {
     view_port_input_callback_set(view_port, input_callback, event_queue);
 
     FuriTimer *timer =
-            furi_timer_alloc(update_timer_callback, FuriTimerTypePeriodic, event_queue);
+        furi_timer_alloc(update_timer_callback, FuriTimerTypePeriodic, event_queue);
     furi_timer_start(timer, furi_kernel_get_tick_frequency() / 25);
 
     Gui *gui = furi_record_open("gui");
@@ -511,7 +666,6 @@ int32_t blackjack_app(void *p) {
         furi_mutex_acquire(game_state->mutex, FuriWaitForever);
         if (event_status == FuriStatusOk) {
             if (event.type == EventTypeKey) {
-
                 if (event.input.type == InputTypePress) {
                     switch (event.input.key) {
                         case InputKeyUp:
@@ -546,12 +700,10 @@ int32_t blackjack_app(void *p) {
             }
         } else {
             FURI_LOG_D(APP_NAME, "osMessageQueue: event timeout");
-            // event timeout
         }
         view_port_update(view_port);
         furi_mutex_release(game_state->mutex);
     }
-
 
     furi_timer_free(timer);
     view_port_enabled_set(view_port, false);
