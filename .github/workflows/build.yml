@@ -1,0 +1,47 @@
+name: Build blackjack.fap
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ufbt
+        run: pip install --upgrade ufbt
+
+      - name: Build .fap
+        run: ufbt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blackjack-fap
+          path: .ufbt/build/blackjack.fap
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: .ufbt/build/blackjack.fap
+
+      - name: Publish rolling "latest" release on main
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest build
+          prerelease: true
+          files: .ufbt/build/blackjack.fap
